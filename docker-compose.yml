@@ -1,0 +1,16 @@
+version: '3.8'
+services:
+  edgex-ai-server:
+    image: node:20
+    container_name: edgex-ai-server
+    working_dir: /app
+    ports:
+      - "12345:12345"
+    environment:
+      - NODE_ENV=production
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PORT=12345
+    volumes:
+      - ./:/app
+    command: bash -c "npm install && node server.js"
+    restart: unless-stopped
