@@ -26,12 +26,20 @@ const config = {
     fastCollectSec: 5,
     confirmWaitMs: 1000,
     priceOffset: 0.001,
+    dynamicOffset: {
+        enabled: true,
+        minOffset: 0.0002,
+        maxOffset: 0.0015,
+        volatilityFactor: 0.8,
+        fallbackOffset: 0.001
+    },
     externalMarket: {
         enabled: true,
         symbol: 'ETHUSDT',
-        ttl: 60,
+        ttl: 10,
         klineInterval: '1m',
-        klineLimit: 60
+        klineLimit: 60,
+        priceDriftThreshold: 0.002
     },
     riskManagement: {
         enabled: true,
@@ -39,7 +47,17 @@ const config = {
         takeProfitPct: 1.0,
         maxHoldMinutes: 30,
         maxOrderWaitSeconds: 60,
-        signalConfirmationCount: 1
+        signalConfirmationCount: 1,
+        dailyLossLimit: -30,
+        maxConsecutiveLosses: 3,
+        pauseMinutesOnBreach: 60
+    },
+    dataHealth: {
+        enabled: true,
+        maxStagnantCycles: 5,
+        maxStagnantMs: 120000,
+        externalDrift: 0.02,
+        reloadDelaySeconds: 5
     }
 };
 
@@ -77,6 +95,23 @@ let lastOpenOrdersSnapshot = [];
 let signalHistory = {
     last: null,
     count: 0
+};
+let pnlTracker = {
+    realized: 0,
+    dailyRealized: 0,
+    dailyDate: null,
+    consecutiveLosses: 0,
+    lastTradePnL: null
+};
+let riskPauseUntil = 0;
+const RELOAD_STATE_KEY = 'edgexBotReloadState';
+let lastExternalSnapshot = null;
+const healthMonitor = {
+    lastPrice: null,
+    lastChangeTime: 0,
+    stagnantCycles: 0,
+    reloading: false,
+    lastReason: null
 };
 
 function setReactInputValue(input, value) {
@@ -124,12 +159,26 @@ function gmRequestJSON(url) {
     });
 }
 
-async function getExternalMarketSnapshot() {
+async function getExternalMarketSnapshot(referencePrice) {
     if (!config.externalMarket?.enabled) return null;
 
     const now = Date.now();
-    if (externalDataCache.payload && (now - externalDataCache.timestamp) < (config.externalMarket.ttl * 1000)) {
-        return externalDataCache.payload;
+    const cache = externalDataCache.payload;
+    const ttlMs = (config.externalMarket.ttl ?? 10) * 1000;
+    const priceThreshold = config.externalMarket.priceDriftThreshold ?? 0.0;
+
+    if (cache) {
+        const age = now - externalDataCache.timestamp;
+        const cachedPrice = Number.isFinite(cache?.ticker?.lastPrice) ? cache.ticker.lastPrice : null;
+        const hasFreshPrice = Number.isFinite(referencePrice) && Number.isFinite(cachedPrice);
+        const priceDrift = hasFreshPrice && referencePrice > 0
+            ? Math.abs(referencePrice - cachedPrice) / referencePrice
+            : 0;
+
+        if (age < ttlMs && (!hasFreshPrice || priceDrift <= priceThreshold)) {
+            lastExternalSnapshot = cache;
+            return cache;
+        }
     }
 
     const symbol = config.externalMarket.symbol;
@@ -142,6 +191,7 @@ async function getExternalMarketSnapshot() {
             gmRequestJSON(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${klineInterval}&limit=${klineLimit}`)
         ]);
 
+        const lastPrice = parseFloat(ticker.lastPrice);
         const formatted = {
             source: 'binance',
             symbol,
@@ -152,7 +202,7 @@ async function getExternalMarketSnapshot() {
                 quoteVolume: parseFloat(ticker.quoteVolume),
                 highPrice: parseFloat(ticker.highPrice),
                 lowPrice: parseFloat(ticker.lowPrice),
-                lastPrice: parseFloat(ticker.lastPrice)
+                lastPrice: lastPrice
             },
             klines: klines.map(item => ({
                 openTime: item[0],
@@ -165,6 +215,7 @@ async function getExternalMarketSnapshot() {
         };
 
         externalDataCache = { timestamp: now, payload: formatted };
+        lastExternalSnapshot = formatted;
         return formatted;
     } catch (error) {
         if (config.debugMode) log(`外部行情数据获取失败: ${error.message || error}`, 'warn');
@@ -184,9 +235,15 @@ function getActiveOrders() {
         const quantityText = normalizeText(cells[2]?.textContent || '');
         const sideText = normalizeText(cells[3]?.textContent || '');
         const orderIdText = normalizeText(cells[5]?.textContent || '');
+        const timeText = normalizeText(cells[6]?.textContent || '');
 
         const price = parseFloat(priceText.replace(/,/g, ''));
         const { filled, total } = parseQuantityPair(quantityText);
+        let orderTime = null;
+        if (timeText) {
+            const parsed = Date.parse(timeText.replace(/-/g, '/'));
+            if (!Number.isNaN(parsed)) orderTime = parsed;
+        }
 
         let side = null;
         if (sideText.includes('买')) side = 'buy';
@@ -199,7 +256,8 @@ function getActiveOrders() {
             filledQty: Number.isFinite(filled) ? filled : 0,
             totalQty: Number.isFinite(total) ? total : 0,
             side,
-            orderId: orderIdText
+            orderId: orderIdText,
+            orderTime
         };
     }).filter(order => order && order.side && Number.isFinite(order.price) && order.totalQty > 0);
 }
@@ -229,6 +287,17 @@ function toleranceForAmount(amount) {
     return Math.max(0.0001, amount * 0.05);
 }
 
+function pendingOrderMaxAgeMs() {
+    const waitSec = config.riskManagement?.maxOrderWaitSeconds ?? 120;
+    return Math.max(waitSec * 2000, 120000);
+}
+
+function isPendingOrderStale(record) {
+    if (!record) return true;
+    if (Number.isFinite(record.expiresAt) && Date.now() > record.expiresAt) return true;
+    return (Date.now() - record.createdAt) > pendingOrderMaxAgeMs();
+}
+
 function findMatchingPendingOrder(direction, price, amount) {
     const record = pendingOrders[direction];
     if (!record) return null;
@@ -252,10 +321,7 @@ function prunePendingOrderByDirection(direction, ordersSnapshot) {
         Math.abs(order.price - record.price) <= Math.max(0.5, record.price * 0.0015) &&
         Math.abs(order.totalQty - record.amount) <= toleranceForAmount(record.amount));
 
-    const age = Date.now() - record.createdAt;
-    const fallbackAgeLimit = Math.max((config.riskManagement?.maxOrderWaitSeconds || 120) * 2000, 120000);
-
-    if (!match || (Number.isFinite(record.expiresAt) && Date.now() > record.expiresAt) || age > fallbackAgeLimit) {
+    if (!match) {
         pendingOrders[direction] = null;
     }
 }
@@ -319,6 +385,15 @@ function cancelStaleOrders() {
             cancelOrder(match, `委托等待超过${timeoutSec}秒`);
         }
     });
+
+    const now = Date.now();
+    lastOpenOrdersSnapshot.forEach(order => {
+        if (!order || !Number.isFinite(order.orderTime)) return;
+        const age = now - order.orderTime;
+        if (age >= maxAge) {
+            cancelOrder(order, `委托超时 (${Math.round(age / 1000)}秒)`);
+        }
+    });
 }
 
 function updateSignalHistory(signal) {
@@ -349,6 +424,145 @@ function hasRequiredConfirmation(signal) {
     return signalHistory.count >= required;
 }
 
+function clearTimers() {
+    if (mainTimer) {
+        clearTimeout(mainTimer);
+        mainTimer = null;
+    }
+    if (keepAliveTimer) {
+        clearInterval(keepAliveTimer);
+        keepAliveTimer = null;
+    }
+    if (sessionTimer) {
+        clearInterval(sessionTimer);
+        sessionTimer = null;
+    }
+}
+
+function saveStateForReload(autoRestart, reason) {
+    updateDailyPnlState();
+    const snapshot = {
+        version: '7.0',
+        timestamp: Date.now(),
+        autoRestart: Boolean(autoRestart),
+        tradeCount,
+        totalVolume,
+        pnlTracker: {
+            realized: pnlTracker.realized,
+            dailyRealized: pnlTracker.dailyRealized,
+            dailyDate: pnlTracker.dailyDate,
+            consecutiveLosses: pnlTracker.consecutiveLosses,
+            lastTradePnL: pnlTracker.lastTradePnL
+        },
+        riskPauseUntil,
+        reason
+    };
+    try {
+        localStorage.setItem(RELOAD_STATE_KEY, JSON.stringify(snapshot));
+    } catch (error) {
+        console.warn('[EdgeX-AI] 保存重载状态失败:', error);
+    }
+}
+
+function restoreStateIfNeeded() {
+    let raw;
+    try {
+        raw = localStorage.getItem(RELOAD_STATE_KEY);
+    } catch (error) {
+        console.warn('[EdgeX-AI] 读取重载状态失败:', error);
+        return;
+    }
+    if (!raw) return;
+
+    let state = null;
+    try {
+        state = JSON.parse(raw);
+    } catch (error) {
+        console.warn('[EdgeX-AI] 重载状态解析失败:', error);
+    }
+
+    localStorage.removeItem(RELOAD_STATE_KEY);
+
+    if (!state || !state.timestamp) return;
+    const age = Date.now() - state.timestamp;
+    if (age > 10 * 60 * 1000) return; // discard if older than 10 minutes
+
+    tradeCount = Number.isFinite(state.tradeCount) ? state.tradeCount : tradeCount;
+    totalVolume = Number.isFinite(state.totalVolume) ? state.totalVolume : totalVolume;
+    if (state.pnlTracker) {
+        pnlTracker.realized = Number.isFinite(state.pnlTracker.realized) ? state.pnlTracker.realized : pnlTracker.realized;
+        pnlTracker.dailyRealized = Number.isFinite(state.pnlTracker.dailyRealized) ? state.pnlTracker.dailyRealized : pnlTracker.dailyRealized;
+        pnlTracker.dailyDate = state.pnlTracker.dailyDate || pnlTracker.dailyDate;
+        pnlTracker.consecutiveLosses = Number.isFinite(state.pnlTracker.consecutiveLosses) ? state.pnlTracker.consecutiveLosses : pnlTracker.consecutiveLosses;
+        pnlTracker.lastTradePnL = Number.isFinite(state.pnlTracker.lastTradePnL) ? state.pnlTracker.lastTradePnL : pnlTracker.lastTradePnL;
+    }
+    riskPauseUntil = Number.isFinite(state.riskPauseUntil) ? state.riskPauseUntil : riskPauseUntil;
+    updateStats();
+
+    if (state.autoRestart) {
+        log('🔄 检测到自动重载状态，准备恢复运行');
+        setTimeout(() => startScript(), 4000);
+    }
+}
+
+function triggerAutoRecovery(reason) {
+    const cfg = config.dataHealth;
+    if (!cfg?.enabled || healthMonitor.reloading) return;
+    healthMonitor.reloading = true;
+    healthMonitor.lastReason = reason;
+
+    const wasRunning = isRunning;
+    saveStateForReload(wasRunning, reason);
+    stopScript({ silent: true });
+
+    const delayMs = Math.max(1000, (cfg.reloadDelaySeconds ?? 5) * 1000);
+    log(`🔁 数据异常(${reason})，${Math.round(delayMs / 1000)}秒后自动刷新`);
+    setTimeout(() => {
+        try {
+            window.location.reload();
+        } catch (error) {
+            console.error('[EdgeX-AI] 自动刷新失败:', error);
+        }
+    }, delayMs);
+}
+
+function updatePriceHealth(currentPrice, externalPrice) {
+    const cfg = config.dataHealth;
+    if (!cfg?.enabled || healthMonitor.reloading) return;
+    if (!Number.isFinite(currentPrice)) return;
+
+    const now = Date.now();
+    const epsilon = Math.abs(currentPrice) * 1e-5;
+    if (healthMonitor.lastPrice === null || Math.abs(currentPrice - healthMonitor.lastPrice) > epsilon) {
+        healthMonitor.lastPrice = currentPrice;
+        healthMonitor.lastChangeTime = now;
+        healthMonitor.stagnantCycles = 0;
+    } else {
+        healthMonitor.stagnantCycles += 1;
+    }
+
+    let reason = null;
+
+    if (!reason && cfg.maxStagnantCycles && healthMonitor.stagnantCycles >= cfg.maxStagnantCycles) {
+        reason = `价格连续${cfg.maxStagnantCycles}次未更新`;
+    }
+
+    if (!reason && cfg.maxStagnantMs && (now - healthMonitor.lastChangeTime) >= cfg.maxStagnantMs) {
+        reason = `价格已 ${Math.round((now - healthMonitor.lastChangeTime) / 1000)} 秒无变化`;
+    }
+
+    if (!reason && cfg.externalDrift && Number.isFinite(externalPrice) && externalPrice > 0) {
+        const drift = Math.abs(externalPrice - currentPrice) / currentPrice;
+        if (drift >= cfg.externalDrift) {
+            reason = `内外价格偏差 ${(drift * 100).toFixed(2)}%`;
+        }
+    }
+
+    if (reason) {
+        triggerAutoRecovery(reason);
+    }
+}
+
 function syncPositionState(position, currentPrice) {
     if (!position || !position.hasPosition) {
         currentPositionState = null;
@@ -358,9 +572,7 @@ function syncPositionState(position, currentPrice) {
     const normalizedSize = Number.isFinite(position.size) ? position.size : parseFloat(position.size);
     const size = Number.isFinite(normalizedSize) ? normalizedSize : null;
 
-    if (!currentPositionState ||
-        currentPositionState.direction !== position.direction ||
-        (Number.isFinite(size) && Math.abs(currentPositionState.size - size) > 1e-6)) {
+    if (!currentPositionState || currentPositionState.direction !== position.direction) {
         currentPositionState = {
             direction: position.direction,
             size: Number.isFinite(size) ? size : 0,
@@ -369,6 +581,10 @@ function syncPositionState(position, currentPrice) {
             pendingRiskExit: false
         };
         return;
+    }
+
+    if (Number.isFinite(size)) {
+        currentPositionState.size = size;
     }
 
     if (!Number.isFinite(currentPositionState.entryPrice) && Number.isFinite(currentPrice)) {
@@ -385,7 +601,56 @@ function calculateUnrealizedPnlPct(state, currentPrice) {
     return state.direction === 'long' ? change : -change;
 }
 
-async function evaluateRiskExit(position, currentPrice) {
+function updateDailyPnlState() {
+    const today = new Date().toISOString().slice(0, 10);
+    if (pnlTracker.dailyDate !== today) {
+        pnlTracker.dailyDate = today;
+        pnlTracker.dailyRealized = 0;
+        pnlTracker.consecutiveLosses = 0;
+    }
+}
+
+function applyRiskPauseIfNeeded() {
+    const cfg = config.riskManagement;
+    if (!cfg?.enabled) return;
+
+    const pauseMinutes = cfg.pauseMinutesOnBreach ?? 60;
+    if (pauseMinutes <= 0) return;
+
+    riskPauseUntil = Date.now() + pauseMinutes * 60000;
+    log(`⛔ 风险控制：暂停交易 ${pauseMinutes} 分钟`);
+}
+
+function evaluateGlobalRisk() {
+    const cfg = config.riskManagement;
+    if (!cfg?.enabled) return;
+
+    updateDailyPnlState();
+
+    let breached = false;
+
+    if (Number.isFinite(cfg.dailyLossLimit) && pnlTracker.dailyRealized <= cfg.dailyLossLimit) {
+        breached = true;
+        log(`⛔ 达到当日亏损上限 (${pnlTracker.dailyRealized.toFixed(2)} <= ${cfg.dailyLossLimit})`);
+    }
+
+    if (Number.isFinite(cfg.maxConsecutiveLosses) && cfg.maxConsecutiveLosses > 0 &&
+        pnlTracker.consecutiveLosses >= cfg.maxConsecutiveLosses) {
+        breached = true;
+        log(`⛔ 连续亏损次数达到上限 (${pnlTracker.consecutiveLosses})`);
+    }
+
+    if (breached) {
+        applyRiskPauseIfNeeded();
+    }
+}
+
+function canTrade() {
+    if (Date.now() < riskPauseUntil) return false;
+    return true;
+}
+
+async function evaluateRiskExit(position, currentPrice, offset = config.priceOffset) {
     const riskCfg = config.riskManagement;
     if (!riskCfg?.enabled || !currentPositionState) {
         return false;
@@ -429,8 +694,8 @@ async function evaluateRiskExit(position, currentPrice) {
     log(`⚠️ 风险控制触发平仓: ${reason}`);
 
     const closePrice = position.direction === 'long'
-        ? currentPrice * (1 + config.priceOffset)
-        : currentPrice * (1 - config.priceOffset);
+        ? currentPrice * (1 - offset)
+        : currentPrice * (1 + offset);
 
     const success = await executeLimitClose(position, closePrice);
     if (success) {
@@ -465,9 +730,13 @@ function createControlPanel() {
             <div style="font-size:12px;">
                 <div>次数: <span id="trade-count" style="color:#4CAF50;">0</span></div>
                 <div>累计: $<span id="total-volume" style="color:#4CAF50;">0</span></div>
+                <div>盈亏: $<span id="realized-pnl" style="color:#FFEB3B;">0.00</span></div>
+                <div>当日盈亏: $<span id="daily-pnl" style="color:#FFEB3B;">0.00</span></div>
+                <div>连亏: <span id="loss-streak" style="color:#F44336;">0</span></div>
                 <div>时间: <span id="run-time" style="color:#2196F3;">00:00:00</span></div>
                 <div>进度: <span id="data-progress" style="color:#FF9800;">0/8</span></div>
                 <div>持仓: <span id="position-info" style="color:#FFD700;">无</span></div>
+                <div>风险状态: <span id="risk-status" style="color:#FF5722;">正常</span></div>
             </div>
         </div>
     `;
@@ -490,6 +759,10 @@ function updateStats() {
     const elements = {
         count: document.getElementById('trade-count'),
         volume: document.getElementById('total-volume'),
+        pnl: document.getElementById('realized-pnl'),
+        dailyPnl: document.getElementById('daily-pnl'),
+        lossStreak: document.getElementById('loss-streak'),
+        riskStatus: document.getElementById('risk-status'),
         progress: document.getElementById('data-progress'),
         runTime: document.getElementById('run-time'),
         position: document.getElementById('position-info')
@@ -497,6 +770,17 @@ function updateStats() {
 
     if (elements.count) elements.count.textContent = tradeCount;
     if (elements.volume) elements.volume.textContent = totalVolume.toFixed(2);
+    if (elements.pnl) elements.pnl.textContent = pnlTracker.realized.toFixed(2);
+    if (elements.dailyPnl) elements.dailyPnl.textContent = pnlTracker.dailyRealized.toFixed(2);
+    if (elements.lossStreak) elements.lossStreak.textContent = pnlTracker.consecutiveLosses;
+    if (elements.riskStatus) {
+        if (Date.now() < riskPauseUntil) {
+            const remaining = Math.max(0, Math.ceil((riskPauseUntil - Date.now()) / 60000));
+            elements.riskStatus.textContent = `暂停中(${remaining}分)`;
+        } else {
+            elements.riskStatus.textContent = '正常';
+        }
+    }
     if (elements.progress) elements.progress.textContent = `${priceHistory.length}/${config.priceHistoryLength}`;
 
     if (elements.runTime) {
@@ -583,6 +867,25 @@ function calculateTechnicalIndicators() {
     return { ma5, ma8, volatility, trend };
 }
 
+function computeDynamicOffset(currentPrice, indicators) {
+    const cfg = config.dynamicOffset;
+    if (!cfg?.enabled || !indicators) {
+        return config.priceOffset;
+    }
+
+    const volPct = Number.isFinite(indicators.volatility) ? indicators.volatility : null;
+    if (!Number.isFinite(volPct) || volPct <= 0) {
+        return cfg.fallbackOffset ?? config.priceOffset;
+    }
+
+    const normalizedVol = volPct / 100; // convert to decimal fraction
+    const rawOffset = normalizedVol * (cfg.volatilityFactor ?? 0.8);
+    const minOffset = cfg.minOffset ?? 0.0002;
+    const maxOffset = cfg.maxOffset ?? 0.002;
+    const safeOffset = Math.min(Math.max(rawOffset, minOffset), maxOffset);
+    return Number.isFinite(safeOffset) && safeOffset > 0 ? safeOffset : (cfg.fallbackOffset ?? config.priceOffset);
+}
+
 function getAIDecision(currentPrice) {
     return new Promise((resolve) => {
         if (!config.enableAI || priceHistory.length < config.priceHistoryLength) {
@@ -593,7 +896,7 @@ function getAIDecision(currentPrice) {
         const indicators = calculateTechnicalIndicators();
         const position = getCurrentPosition();
 
-        getExternalMarketSnapshot().then(externalMarket => {
+        getExternalMarketSnapshot(currentPrice).then(externalMarket => {
             const enhancedData = {
                 symbol: config.ticker + 'USD',
                 timestamp: Date.now(),
@@ -734,15 +1037,34 @@ async function executeLimitOrder(direction, price, amount) {
     log(`准备限价${direction === 'buy' ? '买入' : '卖出'}: ${amount} @ ${price.toFixed(2)}`);
 
     try {
-        const numericAmount = parseFloat(amount);
-        if (pendingOrders[direction]) {
-            const pendingMatch = findMatchingPendingOrder(direction, price, numericAmount);
-            if (pendingMatch) {
+        if (!canTrade()) {
+            log('⛔ 处于风险暂停状态，跳过开仓');
+            return false;
+        }
+
+        const record = pendingOrders[direction];
+        if (record) {
+            if (!isPendingOrderStale(record)) {
                 log(`⚠️ ${direction === 'buy' ? '买入' : '卖出'}委托仍在等待 (本地记录)，跳过重复下单`);
                 return false;
             }
+
+            const orders = getActiveOrders();
+            const match = orders.find(order =>
+                order.side === direction &&
+                Math.abs(order.price - record.price) <= Math.max(0.5, record.price * 0.0015) &&
+                Math.abs(order.totalQty - record.amount) <= toleranceForAmount(record.amount)
+            );
+
+            if (match) {
+                cancelOrder(match, '委托超时，自动撤销后再下单');
+                return false;
+            }
+
+            pendingOrders[direction] = null;
         }
 
+        const numericAmount = parseFloat(amount);
         const existingOrder = findMatchingActiveOrder(direction, price, amount);
         if (existingOrder) {
             log(`⚠️ 已存在未成交的${direction === 'buy' ? '买入' : '卖出'}委托 (${existingOrder.totalQty.toFixed(4)} @ ${existingOrder.price.toFixed(2)})，跳过重复下单`);
@@ -855,6 +1177,15 @@ async function executeLimitClose(position, price) {
                     closeConfirmBtn.click();
                     tradeCount += 1;
                     totalVolume += position.size * price;
+                    const pnl = position.direction === 'long'
+                        ? (price - (currentPositionState?.entryPrice ?? price)) * position.size
+                        : ((currentPositionState?.entryPrice ?? price) - price) * position.size;
+                    updateDailyPnlState();
+                    pnlTracker.realized += pnl;
+                    pnlTracker.dailyRealized += pnl;
+                    pnlTracker.lastTradePnL = pnl;
+                    pnlTracker.consecutiveLosses = pnl < 0 ? pnlTracker.consecutiveLosses + 1 : 0;
+                    evaluateGlobalRisk();
                     log(`🎉 限价平仓成功 #${tradeCount}`);
                     const closeDir = position.direction === 'long' ? 'sell' : 'buy';
                     pendingOrders[closeDir] = null;
@@ -878,16 +1209,18 @@ async function executeLimitClose(position, price) {
     }
 }
 
-async function executeSmartTrade(aiSignal, currentPrice) {
+async function executeSmartTrade(aiSignal, currentPrice, offset = config.priceOffset) {
     const position = getCurrentPosition();
 
-    const buyPrice = currentPrice * (1 - config.priceOffset);
-    const sellPrice = currentPrice * (1 + config.priceOffset);
+    const openLongPrice = currentPrice * (1 - offset);
+    const openShortPrice = currentPrice * (1 + offset);
+    const closeLongPrice = currentPrice * (1 - offset);
+    const closeShortPrice = currentPrice * (1 + offset);
 
     if (position && position.hasPosition) {
         if ((position.direction === 'long' && aiSignal === 'sell') ||
             (position.direction === 'short' && aiSignal === 'buy')) {
-            const closePrice = position.direction === 'long' ? sellPrice : buyPrice;
+            const closePrice = position.direction === 'long' ? closeLongPrice : closeShortPrice;
             log(`持有${position.direction}仓位，AI建议${aiSignal}，执行平仓`);
             return await executeLimitClose(position, closePrice);
         } else {
@@ -905,9 +1238,9 @@ async function executeSmartTrade(aiSignal, currentPrice) {
             return false;
         }
         if (aiSignal === 'buy') {
-            return await executeLimitOrder('buy', buyPrice, config.quantity);
+            return await executeLimitOrder('buy', openLongPrice, config.quantity);
         } else if (aiSignal === 'sell') {
-            return await executeLimitOrder('sell', sellPrice, config.quantity);
+            return await executeLimitOrder('sell', openShortPrice, config.quantity);
         }
     }
 
@@ -934,12 +1267,19 @@ async function mainTradingLoop() {
         return;
     }
 
+    evaluateGlobalRisk();
+
     syncPositionState(position, price);
     reconcilePendingOrders();
     cancelStaleOrders();
 
+    const indicators = calculateTechnicalIndicators();
+    const externalPrice = Number.isFinite(lastExternalSnapshot?.ticker?.lastPrice) ? lastExternalSnapshot.ticker.lastPrice : null;
+    updatePriceHealth(price, externalPrice);
+    const currentOffset = computeDynamicOffset(price, indicators);
+
     if (position && position.hasPosition) {
-        const riskHandled = await evaluateRiskExit(position, price);
+        const riskHandled = await evaluateRiskExit(position, price, currentOffset);
         if (riskHandled) {
             const waitMs = Math.max(config.confirmWaitMs || 1000, 4000);
             log('⏳ 风险控制已提交平仓，等待执行后继续');
@@ -955,7 +1295,7 @@ async function mainTradingLoop() {
         updateSignalHistory(aiDecision);
 
         if (aiDecision !== 'hold') {
-            await executeSmartTrade(aiDecision, price);
+            await executeSmartTrade(aiDecision, price, currentOffset);
         } else {
             log('AI建议观望');
         }
@@ -1017,6 +1357,7 @@ function startScript() {
     isRunning = true;
     startTime = Date.now();
     resetSignalHistory();
+    updateDailyPnlState();
     log('🚀 EdgeX AI量化交易机器人已启动');
 
     setupKeepAlive();
@@ -1024,15 +1365,20 @@ function startScript() {
     mainTimer = setTimeout(mainTradingLoop, 3000);
 }
 
-function stopScript() {
+function stopScript(options = {}) {
+    const { silent = false } = options;
+
+    if (!silent) {
+        log('⏹️ 脚本已停止');
+    }
+
     isRunning = false;
-    log('⏹️ 脚本已停止');
+    clearTimers();
 
-    if (mainTimer) clearTimeout(mainTimer);
-    if (keepAliveTimer) clearInterval(keepAliveTimer);
-    if (sessionTimer) clearInterval(sessionTimer);
+    if (!silent) {
+        log(`运行总结: 交易${tradeCount}次, 总量$${totalVolume.toFixed(2)}`);
+    }
 
-    log(`运行总结: 交易${tradeCount}次, 总量$${totalVolume.toFixed(2)}`);
     pendingOrders.buy = null;
     pendingOrders.sell = null;
     lastOpenOrdersSnapshot = [];
@@ -1062,9 +1408,11 @@ function stopScript() {
                 return Promise.resolve(false);
             }
 
+            const indicators = calculateTechnicalIndicators();
+            const offset = computeDynamicOffset(basePrice, indicators);
             const tradePrice = direction === 'buy'
-                ? basePrice * (1 - config.priceOffset)
-                : basePrice * (1 + config.priceOffset);
+                ? basePrice * (1 - offset)
+                : basePrice * (1 + offset);
 
             return executeLimitOrder(direction, tradePrice, manualAmount ?? config.quantity);
         },
@@ -1075,6 +1423,8 @@ function stopScript() {
     if (typeof unsafeWindow !== 'undefined') {
         unsafeWindow.edgexBot = api;
     }
+
+    restoreStateIfNeeded();
 
     console.log('[EdgeX-AI] 脚本已初始化完成');
 })();
