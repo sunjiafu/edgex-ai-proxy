@@ -18,12 +18,50 @@ function safe(val, def) {
     return val === undefined || val === null || (typeof val === "number" && isNaN(val)) ? def : val;
 }
 
+function formatNumber(val, fractionDigits = 2) {
+    if (val === undefined || val === null) return '未知';
+    const num = Number(val);
+    if (!Number.isFinite(num)) return '未知';
+    return num.toFixed(fractionDigits);
+}
+
+function formatExternalMarket(externalMarket) {
+    if (!externalMarket) {
+        return '外部行情: 未获取';
+    }
+
+    const ticker = externalMarket.ticker || {};
+    const latestKlines = Array.isArray(externalMarket.klines)
+        ? externalMarket.klines.slice(-5)
+        : [];
+
+    const klineSummary = latestKlines.length > 0
+        ? latestKlines.map(item =>
+            `${new Date(item.openTime).toISOString().slice(11,16)}开${formatNumber(item.open)}收${formatNumber(item.close)}量${formatNumber(item.volume, 3)}`
+        ).join(' | ')
+        : '无K线数据';
+
+    return `外部行情（来源: ${externalMarket.source || '未知'}，交易对: ${externalMarket.symbol || '未知'}）:
+- 24h 涨跌幅: ${formatNumber(ticker.priceChangePercent)}%
+- 24h 交易量: ${formatNumber(ticker.volume, 3)}
+- 24h 计价量: ${formatNumber(ticker.quoteVolume, 3)}
+- 24h 最高价: ${formatNumber(ticker.highPrice)}
+- 24h 最低价: ${formatNumber(ticker.lowPrice)}
+- 最新价格: ${formatNumber(ticker.lastPrice)}
+- 最近K线(每根${externalMarket.klineInterval || '未知'}): ${klineSummary}`;
+}
+
 app.post('/ai-decision', async (req, res) => {
     try {
         // 接收前端发送的完整交易数据
         const {
-            symbol, currentPrice, priceHistory, indicators, position, tradingStats, priceChange
+            symbol, currentPrice, priceHistory, indicators, position, tradingStats, priceChange, externalMarket
         } = req.body;
+
+        const externalBlock = formatExternalMarket(externalMarket);
+        const priceHistoryDisplay = Array.isArray(priceHistory)
+            ? priceHistory.slice(-Math.min(priceHistory.length, 20)).map(p => formatNumber(p)).join(", ")
+            : '未知';
 
         // 构建AI分析prompt
         const prompt = `
@@ -31,7 +69,7 @@ app.post('/ai-decision', async (req, res) => {
 
 交易对: ${safe(symbol, '未知')}
 当前价格: ${safe(currentPrice, '未知')}
-价格历史: ${Array.isArray(priceHistory) ? priceHistory.slice(-8).join(", ") : '未知'}
+价格历史: ${priceHistoryDisplay}
 技术指标:
 - MA5均线: ${safe(indicators?.ma5, '未计算')}
 - MA8均线: ${safe(indicators?.ma8, '未计算')}
@@ -41,6 +79,7 @@ app.post('/ai-decision', async (req, res) => {
 当前持仓: ${(position && position.hasPosition) ? 
     `${position.direction} ${position.size}` : '无持仓'}
 交易统计: 已完成${tradingStats?.totalTrades || 0}次交易，总量${tradingStats?.totalVolume || 0}
+${externalBlock}
 
 基于以上数据，请给出交易建议。只能回复以下三个词之一：
 - buy：建议买入/做多
