@@ -81,7 +81,7 @@ app.post('/ai-decision', async (req, res) => {
 交易统计: 已完成${tradingStats?.totalTrades || 0}次交易，总量${tradingStats?.totalVolume || 0}
 ${externalBlock}
 
-基于以上数据，请给出交易建议。只能回复以下三个词之一：
+基于以上数据，请给出交易建议。只能回复以下三个词之一，除非出现明显的风险或欠缺信号，否则在buy/sell中择优，hold 只有在波动极低或多空概率接近时才使用：
 - buy：建议买入/做多
 - sell：建议卖出/做空  
 - hold：建议观望/不操作

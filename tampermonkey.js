@@ -16,14 +16,14 @@ const AI_PROXY_API = 'http://154.17.228.72:12345/ai-decision';
 const config = {
     ticker: 'ETH',
     quantity: '0.02',
-    minInterval: 3,
-    maxInterval: 20,
-    priceHistoryLength: 8,
+    minInterval: 1,
+    maxInterval: 4,
+    priceHistoryLength: 20,
     enableAI: true,
     debugMode: true,
     sessionCheckInterval: 5,
     keepAliveInterval: 30,
-    fastCollectSec: 30,
+    fastCollectSec: 5,
     confirmWaitMs: 1000,
     priceOffset: 0.001,
     externalMarket: {
@@ -32,6 +32,14 @@ const config = {
         ttl: 60,
         klineInterval: '1m',
         klineLimit: 60
+    },
+    riskManagement: {
+        enabled: true,
+        stopLossPct: 0.6,
+        takeProfitPct: 1.0,
+        maxHoldMinutes: 30,
+        maxOrderWaitSeconds: 60,
+        signalConfirmationCount: 1
     }
 };
 
@@ -60,6 +68,16 @@ let keepAliveTimer = null;
 let sessionTimer = null;
 let startTime = Date.now();
 let externalDataCache = { timestamp: 0, payload: null };
+let currentPositionState = null;
+let pendingOrders = {
+    buy: null,
+    sell: null
+};
+let lastOpenOrdersSnapshot = [];
+let signalHistory = {
+    last: null,
+    count: 0
+};
 
 function setReactInputValue(input, value) {
     const prototype = Object.getPrototypeOf(input);
@@ -204,6 +222,221 @@ function findMatchingActiveOrder(direction, price, amount) {
         if (hasTargetAmount && Math.abs(order.totalQty - targetAmount) > amountTolerance) return false;
         return true;
     }) || null;
+}
+
+function toleranceForAmount(amount) {
+    if (!Number.isFinite(amount) || amount <= 0) return 0.0001;
+    return Math.max(0.0001, amount * 0.05);
+}
+
+function findMatchingPendingOrder(direction, price, amount) {
+    const record = pendingOrders[direction];
+    if (!record) return null;
+
+    const priceTolerance = Math.max(0.5, price * 0.0015);
+    const amountTolerance = toleranceForAmount(amount);
+
+    if (Math.abs(record.price - price) <= priceTolerance &&
+        Math.abs(record.amount - amount) <= amountTolerance) {
+        return record;
+    }
+
+    return null;
+}
+
+function prunePendingOrderByDirection(direction, ordersSnapshot) {
+    const record = pendingOrders[direction];
+    if (!record) return;
+
+    const match = ordersSnapshot?.find(order => order.side === direction &&
+        Math.abs(order.price - record.price) <= Math.max(0.5, record.price * 0.0015) &&
+        Math.abs(order.totalQty - record.amount) <= toleranceForAmount(record.amount));
+
+    const age = Date.now() - record.createdAt;
+    const fallbackAgeLimit = Math.max((config.riskManagement?.maxOrderWaitSeconds || 120) * 2000, 120000);
+
+    if (!match || (Number.isFinite(record.expiresAt) && Date.now() > record.expiresAt) || age > fallbackAgeLimit) {
+        pendingOrders[direction] = null;
+    }
+}
+
+function reconcilePendingOrders() {
+    const orders = getActiveOrders();
+    prunePendingOrderByDirection('buy', orders);
+    prunePendingOrderByDirection('sell', orders);
+    lastOpenOrdersSnapshot = orders;
+    return orders;
+}
+
+function hasOutstandingOrders() {
+    if (pendingOrders.buy || pendingOrders.sell) return true;
+    return Array.isArray(lastOpenOrdersSnapshot) && lastOpenOrdersSnapshot.length > 0;
+}
+
+function findCancelButton(row) {
+    if (!row) return null;
+    const buttons = Array.from(row.querySelectorAll('button'));
+    return buttons.find(btn => btn.textContent && btn.textContent.includes('取消')) || null;
+}
+
+function cancelOrder(order, reason) {
+    if (!order || !order.row) return false;
+    const cancelBtn = findCancelButton(order.row);
+    if (!cancelBtn) {
+        log('❌ 找不到撤单按钮，无法取消委托');
+        return false;
+    }
+
+    cancelBtn.click();
+    log(`⚠️ ${reason}，已尝试撤销${order.side === 'buy' ? '买入' : '卖出'}委托 (${order.totalQty.toFixed(4)} @ ${order.price.toFixed(2)})`);
+    pendingOrders[order.side] = null;
+    return true;
+}
+
+function cancelStaleOrders() {
+    const riskCfg = config.riskManagement;
+    if (!riskCfg?.enabled) return;
+
+    const timeoutSec = Number.isFinite(riskCfg.maxOrderWaitSeconds) ? riskCfg.maxOrderWaitSeconds : null;
+    if (!timeoutSec || timeoutSec <= 0) return;
+
+    const maxAge = timeoutSec * 1000;
+
+    ['buy', 'sell'].forEach(direction => {
+        const record = pendingOrders[direction];
+        if (!record) return;
+
+        const match = lastOpenOrdersSnapshot.find(order =>
+            order.side === direction &&
+            Math.abs(order.price - record.price) <= Math.max(0.5, record.price * 0.0015) &&
+            Math.abs(order.totalQty - record.amount) <= toleranceForAmount(record.amount)
+        );
+
+        if (!match) return;
+
+        const age = Date.now() - record.createdAt;
+        if (age >= maxAge) {
+            cancelOrder(match, `委托等待超过${timeoutSec}秒`);
+        }
+    });
+}
+
+function updateSignalHistory(signal) {
+    if (signal === 'buy' || signal === 'sell') {
+        if (signalHistory.last === signal) {
+            signalHistory.count += 1;
+        } else {
+            signalHistory.last = signal;
+            signalHistory.count = 1;
+        }
+    } else {
+        signalHistory.last = null;
+        signalHistory.count = 0;
+    }
+    return signalHistory.count;
+}
+
+function resetSignalHistory() {
+    signalHistory.last = null;
+    signalHistory.count = 0;
+}
+
+function hasRequiredConfirmation(signal) {
+    const required = config.riskManagement?.signalConfirmationCount || 1;
+    if (required <= 1) return true;
+    if (signal !== 'buy' && signal !== 'sell') return false;
+    if (signalHistory.last !== signal) return false;
+    return signalHistory.count >= required;
+}
+
+function syncPositionState(position, currentPrice) {
+    if (!position || !position.hasPosition) {
+        currentPositionState = null;
+        return;
+    }
+
+    const normalizedSize = Number.isFinite(position.size) ? position.size : parseFloat(position.size);
+    const size = Number.isFinite(normalizedSize) ? normalizedSize : null;
+
+    if (!currentPositionState ||
+        currentPositionState.direction !== position.direction ||
+        (Number.isFinite(size) && Math.abs(currentPositionState.size - size) > 1e-6)) {
+        currentPositionState = {
+            direction: position.direction,
+            size: Number.isFinite(size) ? size : 0,
+            entryPrice: Number.isFinite(currentPrice) ? currentPrice : null,
+            openedAt: Date.now(),
+            pendingRiskExit: false
+        };
+        return;
+    }
+
+    if (!Number.isFinite(currentPositionState.entryPrice) && Number.isFinite(currentPrice)) {
+        currentPositionState.entryPrice = currentPrice;
+    }
+}
+
+function calculateUnrealizedPnlPct(state, currentPrice) {
+    if (!state || !Number.isFinite(state.entryPrice) || state.entryPrice <= 0 || !Number.isFinite(currentPrice)) {
+        return null;
+    }
+
+    const change = (currentPrice - state.entryPrice) / state.entryPrice * 100;
+    return state.direction === 'long' ? change : -change;
+}
+
+async function evaluateRiskExit(position, currentPrice) {
+    const riskCfg = config.riskManagement;
+    if (!riskCfg?.enabled || !currentPositionState) {
+        return false;
+    }
+
+    const closeDirection = position.direction === 'long' ? 'sell' : 'buy';
+
+    if (currentPositionState.pendingRiskExit) {
+        const stillPending = findMatchingActiveOrder(closeDirection, currentPrice, currentPositionState.size);
+        if (stillPending) {
+            return false;
+        }
+        currentPositionState.pendingRiskExit = false;
+    }
+
+    const pnlPct = calculateUnrealizedPnlPct(currentPositionState, currentPrice);
+    const elapsedMinutes = (Date.now() - currentPositionState.openedAt) / 60000;
+
+    const stopLoss = Number.isFinite(riskCfg.stopLossPct) ? Math.abs(riskCfg.stopLossPct) : null;
+    const takeProfit = Number.isFinite(riskCfg.takeProfitPct) ? Math.abs(riskCfg.takeProfitPct) : null;
+    const maxDuration = Number.isFinite(riskCfg.maxHoldMinutes) ? Math.abs(riskCfg.maxHoldMinutes) : null;
+
+    let reason = null;
+
+    if (stopLoss !== null && pnlPct !== null && pnlPct <= -stopLoss) {
+        reason = `达到止损 ${pnlPct.toFixed(2)}%`;
+    } else if (takeProfit !== null && pnlPct !== null && pnlPct >= takeProfit) {
+        reason = `达到止盈 ${pnlPct.toFixed(2)}%`;
+    } else if (maxDuration !== null && elapsedMinutes >= maxDuration) {
+        reason = `持仓已超过 ${maxDuration} 分钟`;
+    }
+
+    if (!reason) return false;
+
+    const existingCloseOrder = findMatchingActiveOrder(closeDirection, currentPrice, currentPositionState.size);
+    if (existingCloseOrder) {
+        currentPositionState.pendingRiskExit = true;
+        return false;
+    }
+
+    log(`⚠️ 风险控制触发平仓: ${reason}`);
+
+    const closePrice = position.direction === 'long'
+        ? currentPrice * (1 + config.priceOffset)
+        : currentPrice * (1 - config.priceOffset);
+
+    const success = await executeLimitClose(position, closePrice);
+    if (success) {
+        currentPositionState.pendingRiskExit = true;
+    }
+    return success;
 }
 
 function createControlPanel() {
@@ -501,6 +734,15 @@ async function executeLimitOrder(direction, price, amount) {
     log(`准备限价${direction === 'buy' ? '买入' : '卖出'}: ${amount} @ ${price.toFixed(2)}`);
 
     try {
+        const numericAmount = parseFloat(amount);
+        if (pendingOrders[direction]) {
+            const pendingMatch = findMatchingPendingOrder(direction, price, numericAmount);
+            if (pendingMatch) {
+                log(`⚠️ ${direction === 'buy' ? '买入' : '卖出'}委托仍在等待 (本地记录)，跳过重复下单`);
+                return false;
+            }
+        }
+
         const existingOrder = findMatchingActiveOrder(direction, price, amount);
         if (existingOrder) {
             log(`⚠️ 已存在未成交的${direction === 'buy' ? '买入' : '卖出'}委托 (${existingOrder.totalQty.toFixed(4)} @ ${existingOrder.price.toFixed(2)})，跳过重复下单`);
@@ -552,6 +794,23 @@ async function executeLimitOrder(direction, price, amount) {
             if (confirmSuccess) {
                 tradeCount += 1;
                 totalVolume += parseFloat(amount) * price;
+                const parsedAmount = parseFloat(amount);
+                if (Number.isFinite(parsedAmount)) {
+                    currentPositionState = {
+                        direction,
+                        size: parsedAmount,
+                        entryPrice: price,
+                        openedAt: Date.now(),
+                        pendingRiskExit: false
+                    };
+                    pendingOrders[direction] = {
+                        price,
+                        amount: parsedAmount,
+                        createdAt: Date.now(),
+                        expiresAt: config.riskManagement?.maxOrderWaitSeconds ? Date.now() + (config.riskManagement.maxOrderWaitSeconds * 1000) : null
+                    };
+                }
+                resetSignalHistory();
                 log(`🎉 限价${direction === 'buy' ? '买入' : '卖出'}成功 #${tradeCount}`);
                 return true;
             } else {
@@ -573,10 +832,22 @@ async function executeLimitClose(position, price) {
     log(`准备限价平${position.direction === 'long' ? '多' : '空'}: ${position.size} @ ${price.toFixed(2)}`);
 
     try {
+        const closeDirection = position.direction === 'long' ? 'sell' : 'buy';
+        const closeAmount = parseFloat(position.size);
+        const existingCloseOrder = findMatchingActiveOrder(closeDirection, price, closeAmount);
+
+        if (existingCloseOrder) {
+            log(`⚠️ 已存在待平仓委托 (${existingCloseOrder.totalQty.toFixed(4)} @ ${existingCloseOrder.price.toFixed(2)})，跳过重复平仓`);
+            return false;
+        }
+
         const closeLimitBtn = position.row.querySelector(SELECTORS.closeLimitBtn);
         if (closeLimitBtn) {
             closeLimitBtn.click();
             log('已点击限价平仓按钮');
+            if (currentPositionState) {
+                currentPositionState.pendingRiskExit = true;
+            }
 
             setTimeout(() => {
                 const closeConfirmBtn = document.querySelector(SELECTORS.closeConfirmBtn);
@@ -585,8 +856,14 @@ async function executeLimitClose(position, price) {
                     tradeCount += 1;
                     totalVolume += position.size * price;
                     log(`🎉 限价平仓成功 #${tradeCount}`);
+                    const closeDir = position.direction === 'long' ? 'sell' : 'buy';
+                    pendingOrders[closeDir] = null;
+                    currentPositionState = null;
                 } else {
                     log('❌ 找不到平仓确认按钮');
+                    if (currentPositionState) {
+                        currentPositionState.pendingRiskExit = false;
+                    }
                 }
             }, 1200);
 
@@ -618,6 +895,15 @@ async function executeSmartTrade(aiSignal, currentPrice) {
             return false;
         }
     } else {
+        if (hasOutstandingOrders()) {
+            log('⚠️ 存在未完成的挂单，等待处理后再开新仓');
+            return false;
+        }
+        if (!hasRequiredConfirmation(aiSignal)) {
+            const required = config.riskManagement?.signalConfirmationCount || 1;
+            log(`⚠️ ${aiSignal.toUpperCase()} 信号尚未达到确认次数 (${signalHistory.count}/${required})`);
+            return false;
+        }
         if (aiSignal === 'buy') {
             return await executeLimitOrder('buy', buyPrice, config.quantity);
         } else if (aiSignal === 'sell') {
@@ -640,6 +926,7 @@ async function mainTradingLoop() {
 
     const price = getCurrentPriceAndUpdateHistory();
     const isCollecting = priceHistory.length < config.priceHistoryLength;
+    const position = getCurrentPosition();
 
     if (!price) {
         log('未能获取行情，30秒后重试');
@@ -647,10 +934,25 @@ async function mainTradingLoop() {
         return;
     }
 
+    syncPositionState(position, price);
+    reconcilePendingOrders();
+    cancelStaleOrders();
+
+    if (position && position.hasPosition) {
+        const riskHandled = await evaluateRiskExit(position, price);
+        if (riskHandled) {
+            const waitMs = Math.max(config.confirmWaitMs || 1000, 4000);
+            log('⏳ 风险控制已提交平仓，等待执行后继续');
+            mainTimer = setTimeout(mainTradingLoop, waitMs);
+            return;
+        }
+    }
+
     if (isCollecting) {
         log(`数据采集中...${priceHistory.length}/${config.priceHistoryLength}`);
     } else {
         const aiDecision = await getAIDecision(price);
+        updateSignalHistory(aiDecision);
 
         if (aiDecision !== 'hold') {
             await executeSmartTrade(aiDecision, price);
@@ -714,6 +1016,7 @@ function startScript() {
 
     isRunning = true;
     startTime = Date.now();
+    resetSignalHistory();
     log('🚀 EdgeX AI量化交易机器人已启动');
 
     setupKeepAlive();
@@ -730,6 +1033,11 @@ function stopScript() {
     if (sessionTimer) clearInterval(sessionTimer);
 
     log(`运行总结: 交易${tradeCount}次, 总量$${totalVolume.toFixed(2)}`);
+    pendingOrders.buy = null;
+    pendingOrders.sell = null;
+    lastOpenOrdersSnapshot = [];
+    currentPositionState = null;
+    resetSignalHistory();
 }
 
 (function init() {
