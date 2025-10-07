@@ -25,6 +25,12 @@ function formatNumber(val, fractionDigits = 2) {
     return num.toFixed(fractionDigits);
 }
 
+function formatPercent(val, fractionDigits = 2) {
+    const num = Number(val);
+    if (!Number.isFinite(num)) return '未知';
+    return `${num.toFixed(fractionDigits)}%`;
+}
+
 function formatExternalMarket(externalMarket) {
     if (!externalMarket) {
         return '外部行情: 未获取';
@@ -63,6 +69,11 @@ app.post('/ai-decision', async (req, res) => {
             ? priceHistory.slice(-Math.min(priceHistory.length, 20)).map(p => formatNumber(p)).join(", ")
             : '未知';
 
+        const pauseUntil = Number(tradingStats?.riskPauseUntil ?? 0);
+        const pauseRemaining = pauseUntil > Date.now()
+            ? Math.ceil((pauseUntil - Date.now()) / 60000)
+            : 0;
+
         // 构建AI分析prompt
         const prompt = `
 你是专业的加密货币量化交易策略AI。请分析以下数据并给出交易建议：
@@ -71,14 +82,22 @@ app.post('/ai-decision', async (req, res) => {
 当前价格: ${safe(currentPrice, '未知')}
 价格历史: ${priceHistoryDisplay}
 技术指标:
-- MA5均线: ${safe(indicators?.ma5, '未计算')}
-- MA8均线: ${safe(indicators?.ma8, '未计算')}
-- 波动率: ${safe(indicators?.volatility, '未知')}%
+- 均线: MA5 ${formatNumber(indicators?.ma5)}, MA8 ${formatNumber(indicators?.ma8)}, MA20 ${formatNumber(indicators?.ma20)}
+- EMA: EMA12 ${formatNumber(indicators?.ema12)}, EMA26 ${formatNumber(indicators?.ema26)}
+- MACD: Diff ${formatNumber(indicators?.macd)}, Signal ${formatNumber(indicators?.macdSignal)}, Hist ${formatNumber(indicators?.macdHistogram)}
+- RSI14: ${formatNumber(indicators?.rsi14)}
+- 布林带: 上 ${formatNumber(indicators?.bollinger?.upper)}, 中 ${formatNumber(indicators?.bollinger?.basis)}, 下 ${formatNumber(indicators?.bollinger?.lower)}, 带宽 ${formatPercent(indicators?.bollinger?.bandwidth * 100)}
+- 波动率: ${formatPercent(indicators?.volatility)}
+- 动量: 1周期开 ${formatPercent(indicators?.roc1)}, 5周期 ${formatPercent(indicators?.roc5)}, 10周期 ${formatPercent(indicators?.roc10)}
 - 趋势方向: ${safe(indicators?.trend, '未知')}
 价格变化: ${typeof priceChange === 'number' ? priceChange.toFixed(2) + "%" : '未知'}
 当前持仓: ${(position && position.hasPosition) ? 
     `${position.direction} ${position.size}` : '无持仓'}
-交易统计: 已完成${tradingStats?.totalTrades || 0}次交易，总量${tradingStats?.totalVolume || 0}
+交易统计:
+- 累计交易 ${tradingStats?.totalTrades || 0} 次，总成交量 ${formatNumber(tradingStats?.totalVolume)}
+- 累计盈亏 ${formatNumber(tradingStats?.realizedPnl)}，当日盈亏 ${formatNumber(tradingStats?.dailyRealized)}
+- 连续亏损次数 ${tradingStats?.consecutiveLosses || 0}
+- 风险暂停剩余 ${pauseRemaining > 0 ? `${pauseRemaining} 分钟` : '无'}
 ${externalBlock}
 
 基于以上数据，请给出交易建议。只能回复以下三个词之一，除非出现明显的风险或欠缺信号，否则在buy/sell中择优，hold 只有在波动极低或多空概率接近时才使用：
