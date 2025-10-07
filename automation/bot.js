@@ -28,6 +28,31 @@ function computeTradePrice(side, price, offset) {
     return price;
 }
 
+function getAdaptiveOffset(stats) {
+    const base = config.priceOffset;
+    const cfg = config.dynamicOffset;
+    if (!cfg?.enabled) {
+        return base;
+    }
+
+    const vol = Number(stats?.volatility);
+    const factor = Number.isFinite(cfg.factor) ? cfg.factor : 0;
+    let offset = base;
+
+    if (Number.isFinite(vol) && vol >= 0 && factor !== 0) {
+        offset = base + (vol / 100) * factor;
+    }
+
+    if (Number.isFinite(cfg.min) && cfg.min > 0) {
+        offset = Math.max(offset, cfg.min);
+    }
+    if (Number.isFinite(cfg.max) && cfg.max > 0) {
+        offset = Math.min(offset, cfg.max);
+    }
+
+    return Math.max(offset, 1e-6);
+}
+
 function clampIntervalMinutes() {
     const min = Math.max(config.minIntervalMin, 0);
     const max = Math.max(config.maxIntervalMin, min);
@@ -63,8 +88,16 @@ function formatMetric(value, digits = 2) {
     return num.toFixed(digits);
 }
 
+function formatPercentValue(value, digits = 2) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return 'NA';
+    return `${num.toFixed(digits)}%`;
+}
+
 function logIndicatorSummary(indicators) {
     const summary = [
+        `EMA5=${formatMetric(indicators.ema5)}`,
+        `EMA21=${formatMetric(indicators.ema21)}`,
         `RSI14=${formatMetric(indicators.rsi14)}`,
         `MACD=${formatMetric(indicators.macd)}`,
         `Signal=${formatMetric(indicators.macdSignal)}`,
@@ -107,7 +140,7 @@ async function loop(page) {
         return;
     }
 
-    const riskStatus = tradingState.evaluateGlobalRisk();
+    const riskStatus = tradingState.evaluateGlobalRisk(price);
     if (riskStatus.paused) {
         console.warn(`[bot] 风控触发：${riskStatus.reason}`);
     }
@@ -152,23 +185,27 @@ async function loop(page) {
         const spot = externalMarket.spot || {};
         const futures = externalMarket.futures || {};
         const rel = externalMarket.relative || {};
+        const momentum = externalMarket.momentum || {};
         console.log(
             '[bot] 外部行情:',
-            `现货${formatMetric(spot.lastPrice)} `,
-            `24h ${formatMetric(spot.priceChangePercent)}%`,
+            `现货${formatMetric(spot.lastPrice)}`,
+            `24h ${formatPercentValue(spot.priceChangePercent)}`,
+            `60m ${formatPercentValue(momentum.change60m)}`,
+            `4h ${formatPercentValue(momentum.change240m)}`,
             `基差(现货) ${formatMetric(rel.basisVsSpot)} USD`,
-            `标记价 ${formatMetric(futures.markPrice)} `,
-            `资金费率 ${formatMetric(futures.fundingRatePercent)}%`
+            `标记价 ${formatMetric(futures.markPrice)}`,
+            `资金费率 ${formatPercentValue(futures.fundingRatePercent)}`,
+            `ATR14 ${formatMetric(momentum.atr14)} (${formatPercentValue(momentum.atr14 && spot.lastPrice ? (momentum.atr14 / spot.lastPrice) * 100 : null)})`
         );
     }
 
-    const offset = config.priceOffset;
+    const atrValue = externalMarket?.momentum?.atr14 ?? null;
     const nextDelaySec = pickNextDelaySeconds(false);
     const delayText = formatDelay(nextDelaySec);
-    const riskExit = tradingState.evaluateRiskExit(price);
+    const riskExit = tradingState.evaluateRiskExit(price, { atr: atrValue });
 
     if (riskExit) {
-        const targetPrice = computeTradePrice(riskExit.side, price, offset);
+        const targetPrice = computeTradePrice(riskExit.side, price, adaptiveOffset);
         console.log(`[bot] 风险退出触发(${riskExit.reason}) -> 限价${riskExit.side} @ ${targetPrice.toFixed(2)}`);
         const success = await placeLimitOrder(page, {
             side: riskExit.side,
@@ -194,7 +231,7 @@ async function loop(page) {
         if ((position.direction === 'long' && decision === 'sell') ||
             (position.direction === 'short' && decision === 'buy')) {
             const closeSide = position.direction === 'long' ? 'sell' : 'buy';
-            const targetPrice = computeTradePrice(closeSide, price, offset);
+            const targetPrice = computeTradePrice(closeSide, price, adaptiveOffset);
             console.log(`[bot] 平仓 ${position.direction} -> ${closeSide} @ ${targetPrice.toFixed(2)}`);
             const success = await placeLimitOrder(page, {
                 side: closeSide,
@@ -225,6 +262,54 @@ async function loop(page) {
                 return;
             }
 
+            const fundingRate = externalMarket?.futures?.fundingRatePercent;
+            const fundingLongMax = config.riskManagement?.fundingRateLongMax;
+            const fundingShortMin = config.riskManagement?.fundingRateShortMin;
+            if (Number.isFinite(fundingRate)) {
+                if (decision === 'buy' && Number.isFinite(fundingLongMax) && fundingRate > fundingLongMax) {
+                    console.log(`[bot] 资金费率 ${formatPercentValue(fundingRate)} 超过多头阈值 ${formatPercentValue(fundingLongMax)} ，暂不加仓`);
+                    await page.waitForTimeout(nextDelaySec * 1000);
+                    return;
+                }
+                if (decision === 'sell' && Number.isFinite(fundingShortMin) && fundingRate < fundingShortMin) {
+                    console.log(`[bot] 资金费率 ${formatPercentValue(fundingRate)} 低于空头阈值 ${formatPercentValue(fundingShortMin)} ，暂不加仓`);
+                    await page.waitForTimeout(nextDelaySec * 1000);
+                    return;
+                }
+            }
+
+            const mtfThreshold = Math.abs(config.signalFilters?.mtfThreshold ?? 0);
+            if (mtfThreshold > 0 && externalMarket?.momentum) {
+                const change60 = externalMarket.momentum.change60m;
+                if (Number.isFinite(change60)) {
+                    if (decision === 'buy' && change60 < -mtfThreshold) {
+                        console.log(`[bot] 60m 趋势 ${formatPercentValue(change60)} 与做多方向相反，暂不加仓`);
+                        await page.waitForTimeout(nextDelaySec * 1000);
+                        return;
+                    }
+                    if (decision === 'sell' && change60 > mtfThreshold) {
+                        console.log(`[bot] 60m 趋势 ${formatPercentValue(change60)} 与做空方向相反，暂不加仓`);
+                        await page.waitForTimeout(nextDelaySec * 1000);
+                        return;
+                    }
+                }
+
+                const change240 = externalMarket.momentum.change240m;
+                if (Number.isFinite(change240)) {
+                    if (decision === 'buy' && change240 < -mtfThreshold) {
+                        console.log(`[bot] 4h 趋势 ${formatPercentValue(change240)} 与做多方向相反，暂不加仓`);
+                        await page.waitForTimeout(nextDelaySec * 1000);
+                        return;
+                    }
+                    if (decision === 'sell' && change240 > mtfThreshold) {
+                        console.log(`[bot] 4h 趋势 ${formatPercentValue(change240)} 与做空方向相反，暂不加仓`);
+                        await page.waitForTimeout(nextDelaySec * 1000);
+                        return;
+                    }
+                }
+            }
+
+            const orderQuantity = Number(config.quantity) || 0;
             const maxPosition = config.riskManagement?.maxPositionSize;
             if (Number.isFinite(maxPosition) && maxPosition > 0) {
                 const direction = decision === 'buy' ? 'long' : 'short';
@@ -235,7 +320,7 @@ async function loop(page) {
                 const pendingAmount = pendingRecord && Number.isFinite(Number(pendingRecord.amount))
                     ? Number(pendingRecord.amount)
                     : 0;
-                const projectedSize = existingSize + pendingAmount + Number(config.quantity);
+                const projectedSize = existingSize + pendingAmount + orderQuantity;
 
                 if (projectedSize > maxPosition + 1e-8) {
                     console.log(`[bot] 已持有/挂单 ${direction} ${projectedSize.toFixed(4)} 超过最大持仓 ${maxPosition}，暂不加仓，下一轮 ${delayText} 后再评估`);
@@ -244,12 +329,12 @@ async function loop(page) {
                 }
             }
 
-            const targetPrice = computeTradePrice(decision, price, offset);
-            console.log(`[bot] 下限价单 ${decision} @ ${targetPrice.toFixed(2)} 数量 ${config.quantity}`);
+            const targetPrice = computeTradePrice(decision, price, adaptiveOffset);
+            console.log(`[bot] 下限价单 ${decision} @ ${targetPrice.toFixed(2)} 数量 ${orderQuantity}`);
             const success = await placeLimitOrder(page, {
                 side: decision,
                 price: targetPrice,
-                size: config.quantity
+                size: orderQuantity || config.quantity
             });
             if (success) {
                 tradingState.recordTradeSubmission({

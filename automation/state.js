@@ -185,7 +185,7 @@ function createTradingState(config) {
         state.riskPauseUntil = Date.now() + pauseMinutes * 60000;
     }
 
-    function evaluateGlobalRisk() {
+    function evaluateGlobalRisk(currentPrice) {
         if (!riskCfg.enabled) return { paused: false };
 
         updateDailyPnlState();
@@ -202,6 +202,18 @@ function createTradingState(config) {
             riskCfg.maxConsecutiveLosses > 0 &&
             state.pnl.consecutiveLosses >= riskCfg.maxConsecutiveLosses) {
             reason = `连续亏损次数达到上限 (${state.pnl.consecutiveLosses})`;
+        }
+
+        if (!reason && Number.isFinite(riskCfg.dailyDrawdownPausePct) && riskCfg.dailyDrawdownPausePct > 0 && Number.isFinite(currentPrice) && currentPrice > 0) {
+            const baseNotional = (Number.isFinite(state.currentPositionState?.size)
+                ? state.currentPositionState.size
+                : config.quantity) * currentPrice;
+            if (Number.isFinite(baseNotional) && baseNotional > 0) {
+                const drawdownLimit = -Math.abs(riskCfg.dailyDrawdownPausePct) / 100 * baseNotional;
+                if (state.pnl.dailyRealized <= drawdownLimit) {
+                    reason = `当日收益回撤超过 ${riskCfg.dailyDrawdownPausePct}% (累计 ${state.pnl.dailyRealized.toFixed(2)})`;
+                }
+            }
         }
 
         if (reason) {
@@ -222,7 +234,7 @@ function createTradingState(config) {
         return pos.direction === 'long' ? change : -change;
     }
 
-    function evaluateRiskExit(currentPrice) {
+    function evaluateRiskExit(currentPrice, context = {}) {
         if (!riskCfg.enabled) return null;
         const pos = state.currentPositionState;
         if (!pos) return null;
@@ -237,9 +249,24 @@ function createTradingState(config) {
         const pnlPct = calculateUnrealizedPnlPct(currentPrice);
         const elapsedMinutes = (Date.now() - pos.openedAt) / 60000;
 
-        const stopLoss = Number.isFinite(riskCfg.stopLossPct) ? Math.abs(riskCfg.stopLossPct) : null;
-        const takeProfit = Number.isFinite(riskCfg.takeProfitPct) ? Math.abs(riskCfg.takeProfitPct) : null;
+        let stopLoss = Number.isFinite(riskCfg.stopLossPct) ? Math.abs(riskCfg.stopLossPct) : null;
+        let takeProfit = Number.isFinite(riskCfg.takeProfitPct) ? Math.abs(riskCfg.takeProfitPct) : null;
         const maxDuration = Number.isFinite(riskCfg.maxHoldMinutes) ? Math.abs(riskCfg.maxHoldMinutes) : null;
+
+        if (Number.isFinite(context.atr) && Number.isFinite(pos.entryPrice) && pos.entryPrice > 0) {
+            if (Number.isFinite(riskCfg.atrStopLossFactor) && riskCfg.atrStopLossFactor > 0) {
+                const atrStop = (context.atr * riskCfg.atrStopLossFactor / pos.entryPrice) * 100;
+                if (Number.isFinite(atrStop) && atrStop > 0) {
+                    stopLoss = Number.isFinite(stopLoss) ? Math.min(stopLoss, atrStop) : atrStop;
+                }
+            }
+            if (Number.isFinite(riskCfg.atrTakeProfitFactor) && riskCfg.atrTakeProfitFactor > 0) {
+                const atrTp = (context.atr * riskCfg.atrTakeProfitFactor / pos.entryPrice) * 100;
+                if (Number.isFinite(atrTp) && atrTp > 0) {
+                    takeProfit = Number.isFinite(takeProfit) ? Math.max(takeProfit, atrTp) : atrTp;
+                }
+            }
+        }
 
         let reason = null;
 

@@ -37,7 +37,7 @@ module.exports = {
         futuresSymbol: (process.env.BOT_EXTERNAL_FUTURES_SYMBOL || process.env.BOT_EXTERNAL_SYMBOL || 'ETHUSDT').toUpperCase(),
         ttl: parseInt(process.env.BOT_EXTERNAL_TTL_SEC || '10', 10),
         klineInterval: process.env.BOT_EXTERNAL_KLINE_INTERVAL || '1m',
-        klineLimit: parseInt(process.env.BOT_EXTERNAL_KLINE_LIMIT || '60', 10),
+        klineLimit: parseInt(process.env.BOT_EXTERNAL_KLINE_LIMIT || '300', 10),
         timeoutMs: parseInt(process.env.BOT_EXTERNAL_TIMEOUT_MS || '10000', 10)
     },
     riskManagement: {
@@ -50,7 +50,21 @@ module.exports = {
         dailyLossLimit: parseFloat(process.env.BOT_RISK_DAILY_LOSS_LIMIT ?? '-30'),
         maxConsecutiveLosses: parseInt(process.env.BOT_RISK_MAX_CONSECUTIVE_LOSSES ?? '3', 10),
         pauseMinutesOnBreach: parseFloat(process.env.BOT_RISK_PAUSE_MINUTES ?? '60'),
-        maxPositionSize: parseFloat(process.env.BOT_RISK_MAX_POSITION_SIZE ?? '0.22')
+        maxPositionSize: parseFloat(process.env.BOT_RISK_MAX_POSITION_SIZE ?? '0.22'),
+        atrStopLossFactor: parseFloat(process.env.BOT_RISK_ATR_STOP_FACTOR ?? '1.5'),
+        atrTakeProfitFactor: parseFloat(process.env.BOT_RISK_ATR_TP_FACTOR ?? '2.5'),
+        fundingRateLongMax: parseFloat(process.env.BOT_RISK_FUNDING_LONG_MAX ?? '0.01'),
+        fundingRateShortMin: parseFloat(process.env.BOT_RISK_FUNDING_SHORT_MIN ?? '-0.01'),
+        dailyDrawdownPausePct: parseFloat(process.env.BOT_RISK_DAILY_DRAWDOWN_PCT ?? '5')
+    },
+    dynamicOffset: {
+        enabled: (process.env.BOT_DYNAMIC_OFFSET_ENABLED || 'true').toLowerCase() !== 'false',
+        factor: parseFloat(process.env.BOT_DYNAMIC_OFFSET_FACTOR ?? '0.015'),
+        min: process.env.BOT_DYNAMIC_OFFSET_MIN ? parseFloat(process.env.BOT_DYNAMIC_OFFSET_MIN) : null,
+        max: process.env.BOT_DYNAMIC_OFFSET_MAX ? parseFloat(process.env.BOT_DYNAMIC_OFFSET_MAX) : null
+    },
+    signalFilters: {
+        mtfThreshold: parseFloat(process.env.BOT_SIGNAL_MTF_THRESHOLD ?? '0.05')
     },
     storageStatePath,
     hasStorageState: fs.existsSync(storageStatePath),

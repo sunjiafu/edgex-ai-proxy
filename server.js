@@ -48,12 +48,17 @@ function formatExternalMarket(externalMarket) {
     } = externalMarket;
 
     const ageSec = fetchedAt ? Math.floor((Date.now() - fetchedAt) / 1000) : null;
-    const changeLine = [
+    const changeShort = [
         `1m ${formatPercent(momentum.change1m)}`,
         `5m ${formatPercent(momentum.change5m)}`,
         `15m ${formatPercent(momentum.change15m)}`,
         `30m ${formatPercent(momentum.change30m)}`
     ].filter(item => !item.includes('未知')).join(' / ') || '未知';
+
+    const changeHigher = [
+        `60m ${formatPercent(momentum.change60m)}`,
+        `4h ${formatPercent(momentum.change240m)}`
+    ].filter(item => !item.includes('未知')).join(' / ');
 
     const volumeSpike = Number.isFinite(momentum.volumeSpikeRatio)
         ? `${momentum.volumeSpikeRatio.toFixed(2)}x`
@@ -63,13 +68,18 @@ function formatExternalMarket(externalMarket) {
         ? new Date(futures.nextFundingTime).toISOString().slice(11, 16)
         : '未知';
 
+    const atrLine = Number.isFinite(momentum.atr14) && Number.isFinite(spot.lastPrice) && spot.lastPrice !== 0
+        ? `${formatNumber(momentum.atr14)} USD（${formatPercent((momentum.atr14 / spot.lastPrice) * 100)}）`
+        : '未知';
+
     return `外部行情（来源: ${source || '未知'}，交易对: ${symbol || '未知'}${ageSec !== null ? `，${ageSec}s前更新` : ''}）:
 - 现货价格: ${formatNumber(spot.lastPrice)} USD，24h 涨幅: ${formatPercent(spot.priceChangePercent)}
 - 24h 成交量: ${formatNumber(spot.volume24h, 3)}，计价量: ${formatNumber(spot.quoteVolume24h, 3)}
-- 短期动量 (${extCfg.klineInterval || '1m'} K线): ${changeLine}，量能放大: ${volumeSpike}
+- 短期动量 (${extCfg.klineInterval || '1m'} K线): ${changeShort}，量能放大: ${volumeSpike}${changeHigher ? `，高周期: ${changeHigher}` : ''}
 - 基差: 相对现货 ${formatNumber(relative.basisVsSpot)} USD，相对标记价 ${formatNumber(relative.basisVsMark)} USD
 - 标记价: ${formatNumber(futures.markPrice)}，指数价: ${formatNumber(futures.indexPrice)}
-- 资金费率: ${formatPercent(futures.fundingRatePercent)}（下次 ${fundingTime}），未平仓量: ${formatNumber(futures.openInterest, 3)}`;
+- 资金费率: ${formatPercent(futures.fundingRatePercent)}（下次 ${fundingTime}），未平仓量: ${formatNumber(futures.openInterest, 3)}
+- ATR14: ${atrLine}`;
 }
 
 app.post('/ai-decision', async (req, res) => {
@@ -97,8 +107,7 @@ app.post('/ai-decision', async (req, res) => {
 当前价格: ${safe(currentPrice, '未知')}
 价格历史: ${priceHistoryDisplay}
 技术指标:
-- 均线: MA5 ${formatNumber(indicators?.ma5)}, MA8 ${formatNumber(indicators?.ma8)}, MA20 ${formatNumber(indicators?.ma20)}
-- EMA: EMA12 ${formatNumber(indicators?.ema12)}, EMA26 ${formatNumber(indicators?.ema26)}
+- 均线: EMA5 ${formatNumber(indicators?.ema5)}, EMA21 ${formatNumber(indicators?.ema21)}, EMA12 ${formatNumber(indicators?.ema12)}, EMA26 ${formatNumber(indicators?.ema26)}
 - MACD: Diff ${formatNumber(indicators?.macd)}, Signal ${formatNumber(indicators?.macdSignal)}, Hist ${formatNumber(indicators?.macdHistogram)}
 - RSI14: ${formatNumber(indicators?.rsi14)}
 - 布林带: 上 ${formatNumber(indicators?.bollinger?.upper)}, 中 ${formatNumber(indicators?.bollinger?.basis)}, 下 ${formatNumber(indicators?.bollinger?.lower)}, 带宽 ${formatPercent(indicators?.bollinger?.bandwidth * 100)}

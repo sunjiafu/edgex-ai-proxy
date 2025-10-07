@@ -7,13 +7,6 @@ function appendPrice(history, price, maxLength) {
     return next;
 }
 
-function simpleMovingAverage(values, period) {
-    if (values.length < period) return null;
-    const slice = values.slice(-period);
-    const sum = slice.reduce((acc, value) => acc + value, 0);
-    return sum / period;
-}
-
 function exponentialMovingAverage(values, period) {
     if (values.length < period) return null;
     const k = 2 / (period + 1);
@@ -51,9 +44,8 @@ function calculateStandardDeviation(values, period) {
 function calculate(history) {
     const length = history.length;
 
-    const ma5 = simpleMovingAverage(history, 5);
-    const ma8 = simpleMovingAverage(history, 8);
-    const ma20 = simpleMovingAverage(history, 20);
+    const ema5 = exponentialMovingAverage(history, 5);
+    const ema21 = exponentialMovingAverage(history, 21);
     const ema12 = exponentialMovingAverage(history, 12);
     const ema26 = exponentialMovingAverage(history, 26);
 
@@ -108,14 +100,14 @@ function calculate(history) {
     const rsi14 = calculateRSI(history, 14);
 
     let bollinger = null;
-    if (ma20 !== null) {
+    if (ema21 !== null) {
         const stdDev = calculateStandardDeviation(history, 20);
         if (stdDev !== null) {
             bollinger = {
-                upper: ma20 + 2 * stdDev,
-                lower: ma20 - 2 * stdDev,
-                basis: ma20,
-                bandwidth: (2 * stdDev) / ma20
+                upper: ema21 + 2 * stdDev,
+                lower: ema21 - 2 * stdDev,
+                basis: ema21,
+                bandwidth: ema21 !== 0 ? (2 * stdDev) / ema21 : null
             };
         }
     }
@@ -125,9 +117,8 @@ function calculate(history) {
     const roc10 = length >= 11 ? ((history[length - 1] - history[length - 11]) / history[length - 11]) * 100 : null;
 
     return {
-        ma5,
-        ma8,
-        ma20,
+        ema5,
+        ema21,
         ema12,
         ema26,
         macd,

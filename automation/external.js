@@ -36,10 +36,15 @@ function computeMomentum(klines) {
         return {};
     }
 
-    const closes = klines.map(item => toNumber(item[4])).filter(Number.isFinite);
-    const volumes = klines.map(item => toNumber(item[5])).filter(Number.isFinite);
-    const highs = klines.map(item => toNumber(item[2])).filter(Number.isFinite);
-    const lows = klines.map(item => toNumber(item[3])).filter(Number.isFinite);
+    const closesAll = klines.map(item => toNumber(item[4]));
+    const volumesAll = klines.map(item => toNumber(item[5]));
+    const highsAll = klines.map(item => toNumber(item[2]));
+    const lowsAll = klines.map(item => toNumber(item[3]));
+
+    const closes = closesAll.filter(Number.isFinite);
+    const volumes = volumesAll.filter(Number.isFinite);
+    const highs = highsAll.filter(Number.isFinite);
+    const lows = lowsAll.filter(Number.isFinite);
 
     const latestClose = closes[closes.length - 1];
     const safeChange = (len) => {
@@ -62,6 +67,8 @@ function computeMomentum(klines) {
     const change5m = safeChange(5);
     const change15m = safeChange(15);
     const change30m = safeChange(30);
+    const change60m = safeChange(60);
+    const change240m = safeChange(240);
 
     const recentVol5 = sumVolumes(5);
     const prevVol5 = sumVolumes(5, 5);
@@ -73,13 +80,40 @@ function computeMomentum(klines) {
         ? ((Math.max(...highs) - Math.min(...lows)) / latestClose) * 100
         : null;
 
+    // ATR14 计算
+    let atr14 = null;
+    if (Array.isArray(highsAll) && Array.isArray(lowsAll) && Array.isArray(closesAll) && klines.length >= 15) {
+        const period = 14;
+        const trueRanges = [];
+        for (let i = klines.length - period; i < klines.length; i += 1) {
+            const high = toNumber(klines[i][2]);
+            const low = toNumber(klines[i][3]);
+            const prevClose = toNumber(klines[i - 1]?.[4]);
+            if (!Number.isFinite(high) || !Number.isFinite(low) || !Number.isFinite(prevClose)) continue;
+            const tr = Math.max(
+                high - low,
+                Math.abs(high - prevClose),
+                Math.abs(low - prevClose)
+            );
+            if (Number.isFinite(tr)) {
+                trueRanges.push(tr);
+            }
+        }
+        if (trueRanges.length >= period) {
+            atr14 = trueRanges.reduce((acc, value) => acc + value, 0) / trueRanges.length;
+        }
+    }
+
     return {
         change1m,
         change5m,
         change15m,
         change30m,
+        change60m,
+        change240m,
         volumeSpikeRatio,
-        rangePct: highRange
+        rangePct: highRange,
+        atr14
     };
 }
 
