@@ -224,6 +224,26 @@ async function loop(page) {
                 await page.waitForTimeout(nextDelaySec * 1000);
                 return;
             }
+
+            const maxPosition = config.riskManagement?.maxPositionSize;
+            if (Number.isFinite(maxPosition) && maxPosition > 0) {
+                const direction = decision === 'buy' ? 'long' : 'short';
+                const existingSize = stateSnapshot.currentPosition?.direction === direction
+                    ? Number(stateSnapshot.currentPosition.size) || 0
+                    : 0;
+                const pendingRecord = stateSnapshot.pendingOrders?.[decision];
+                const pendingAmount = pendingRecord && Number.isFinite(Number(pendingRecord.amount))
+                    ? Number(pendingRecord.amount)
+                    : 0;
+                const projectedSize = existingSize + pendingAmount + Number(config.quantity);
+
+                if (projectedSize > maxPosition + 1e-8) {
+                    console.log(`[bot] 已持有/挂单 ${direction} ${projectedSize.toFixed(4)} 超过最大持仓 ${maxPosition}，暂不加仓，下一轮 ${delayText} 后再评估`);
+                    await page.waitForTimeout(nextDelaySec * 1000);
+                    return;
+                }
+            }
+
             const targetPrice = computeTradePrice(decision, price, offset);
             console.log(`[bot] 下限价单 ${decision} @ ${targetPrice.toFixed(2)} 数量 ${config.quantity}`);
             const success = await placeLimitOrder(page, {
