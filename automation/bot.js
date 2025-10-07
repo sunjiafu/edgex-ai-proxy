@@ -12,6 +12,7 @@ const {
 const { getDecision } = require('./aiClient');
 const indicators = require('./indicators');
 const { createTradingState } = require('./state');
+const { getSnapshot: getExternalSnapshot } = require('./external');
 
 let priceHistory = [];
 let historyReady = false;
@@ -95,6 +96,7 @@ async function loop(page) {
     const position = await readPosition(page);
     const currentOrders = await readActiveOrders(page);
     const stateSnapshot = tradingState.getStats();
+    const externalMarket = await getExternalSnapshot(price);
     tradingState.syncPositionState(position, price);
     tradingState.updateOrdersSnapshot(currentOrders);
 
@@ -139,12 +141,26 @@ async function loop(page) {
             consecutiveLosses: stateSnapshot.pnl?.consecutiveLosses ?? 0,
             riskPauseUntil: stateSnapshot.riskPauseUntil ?? 0
         },
+        externalMarket,
         timestamp: Date.now()
     };
 
     const decision = await getDecision(payload);
     tradingState.updateSignalHistory(decision);
     logIndicatorSummary(stats);
+    if (externalMarket) {
+        const spot = externalMarket.spot || {};
+        const futures = externalMarket.futures || {};
+        const rel = externalMarket.relative || {};
+        console.log(
+            '[bot] 外部行情:',
+            `现货${formatMetric(spot.lastPrice)} `,
+            `24h ${formatMetric(spot.priceChangePercent)}%`,
+            `基差(现货) ${formatMetric(rel.basisVsSpot)} USD`,
+            `标记价 ${formatMetric(futures.markPrice)} `,
+            `资金费率 ${formatMetric(futures.fundingRatePercent)}%`
+        );
+    }
 
     const offset = config.priceOffset;
     const nextDelaySec = pickNextDelaySeconds(false);

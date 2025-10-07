@@ -36,25 +36,40 @@ function formatExternalMarket(externalMarket) {
         return '外部行情: 未获取';
     }
 
-    const ticker = externalMarket.ticker || {};
-    const latestKlines = Array.isArray(externalMarket.klines)
-        ? externalMarket.klines.slice(-5)
-        : [];
+    const {
+        source,
+        symbol,
+        fetchedAt,
+        spot = {},
+        momentum = {},
+        futures = {},
+        relative = {},
+        config: extCfg = {}
+    } = externalMarket;
 
-    const klineSummary = latestKlines.length > 0
-        ? latestKlines.map(item =>
-            `${new Date(item.openTime).toISOString().slice(11,16)}开${formatNumber(item.open)}收${formatNumber(item.close)}量${formatNumber(item.volume, 3)}`
-        ).join(' | ')
-        : '无K线数据';
+    const ageSec = fetchedAt ? Math.floor((Date.now() - fetchedAt) / 1000) : null;
+    const changeLine = [
+        `1m ${formatPercent(momentum.change1m)}`,
+        `5m ${formatPercent(momentum.change5m)}`,
+        `15m ${formatPercent(momentum.change15m)}`,
+        `30m ${formatPercent(momentum.change30m)}`
+    ].filter(item => !item.includes('未知')).join(' / ') || '未知';
 
-    return `外部行情（来源: ${externalMarket.source || '未知'}，交易对: ${externalMarket.symbol || '未知'}）:
-- 24h 涨跌幅: ${formatNumber(ticker.priceChangePercent)}%
-- 24h 交易量: ${formatNumber(ticker.volume, 3)}
-- 24h 计价量: ${formatNumber(ticker.quoteVolume, 3)}
-- 24h 最高价: ${formatNumber(ticker.highPrice)}
-- 24h 最低价: ${formatNumber(ticker.lowPrice)}
-- 最新价格: ${formatNumber(ticker.lastPrice)}
-- 最近K线(每根${externalMarket.klineInterval || '未知'}): ${klineSummary}`;
+    const volumeSpike = Number.isFinite(momentum.volumeSpikeRatio)
+        ? `${momentum.volumeSpikeRatio.toFixed(2)}x`
+        : '未知';
+
+    const fundingTime = futures.nextFundingTime
+        ? new Date(futures.nextFundingTime).toISOString().slice(11, 16)
+        : '未知';
+
+    return `外部行情（来源: ${source || '未知'}，交易对: ${symbol || '未知'}${ageSec !== null ? `，${ageSec}s前更新` : ''}）:
+- 现货价格: ${formatNumber(spot.lastPrice)} USD，24h 涨幅: ${formatPercent(spot.priceChangePercent)}
+- 24h 成交量: ${formatNumber(spot.volume24h, 3)}，计价量: ${formatNumber(spot.quoteVolume24h, 3)}
+- 短期动量 (${extCfg.klineInterval || '1m'} K线): ${changeLine}，量能放大: ${volumeSpike}
+- 基差: 相对现货 ${formatNumber(relative.basisVsSpot)} USD，相对标记价 ${formatNumber(relative.basisVsMark)} USD
+- 标记价: ${formatNumber(futures.markPrice)}，指数价: ${formatNumber(futures.indexPrice)}
+- 资金费率: ${formatPercent(futures.fundingRatePercent)}（下次 ${fundingTime}），未平仓量: ${formatNumber(futures.openInterest, 3)}`;
 }
 
 app.post('/ai-decision', async (req, res) => {

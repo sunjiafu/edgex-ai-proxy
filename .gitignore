@@ -10,3 +10,5 @@ test-results/
 # Environment & local config
 .env
 .DS_Store
+.env
+package-lock.json

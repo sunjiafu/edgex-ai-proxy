@@ -31,6 +31,15 @@ module.exports = {
     browserArgs: process.env.PLAYWRIGHT_BROWSER_ARGS
         ? process.env.PLAYWRIGHT_BROWSER_ARGS.split(' ').filter(Boolean)
         : [],
+    externalMarket: {
+        enabled: (process.env.BOT_EXTERNAL_ENABLED || 'true').toLowerCase() !== 'false',
+        symbol: (process.env.BOT_EXTERNAL_SYMBOL || 'ETHUSDT').toUpperCase(),
+        futuresSymbol: (process.env.BOT_EXTERNAL_FUTURES_SYMBOL || process.env.BOT_EXTERNAL_SYMBOL || 'ETHUSDT').toUpperCase(),
+        ttl: parseInt(process.env.BOT_EXTERNAL_TTL_SEC || '10', 10),
+        klineInterval: process.env.BOT_EXTERNAL_KLINE_INTERVAL || '1m',
+        klineLimit: parseInt(process.env.BOT_EXTERNAL_KLINE_LIMIT || '60', 10),
+        timeoutMs: parseInt(process.env.BOT_EXTERNAL_TIMEOUT_MS || '10000', 10)
+    },
     riskManagement: {
         enabled: (process.env.BOT_RISK_ENABLED || 'true').toLowerCase() !== 'false',
         stopLossPct: parseFloat(process.env.BOT_RISK_STOP_LOSS_PCT ?? '0.6'),
@@ -40,7 +49,8 @@ module.exports = {
         signalConfirmationCount: parseInt(process.env.BOT_RISK_SIGNAL_CONFIRMATION ?? '1', 10),
         dailyLossLimit: parseFloat(process.env.BOT_RISK_DAILY_LOSS_LIMIT ?? '-30'),
         maxConsecutiveLosses: parseInt(process.env.BOT_RISK_MAX_CONSECUTIVE_LOSSES ?? '3', 10),
-        pauseMinutesOnBreach: parseFloat(process.env.BOT_RISK_PAUSE_MINUTES ?? '60')
+        pauseMinutesOnBreach: parseFloat(process.env.BOT_RISK_PAUSE_MINUTES ?? '60'),
+        maxPositionSize: parseFloat(process.env.BOT_RISK_MAX_POSITION_SIZE ?? '0.22')
     },
     storageStatePath,
     hasStorageState: fs.existsSync(storageStatePath),
