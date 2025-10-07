@@ -120,19 +120,34 @@ function createTradingState(config) {
 
         if (type === 'open') {
             const direction = side === 'buy' ? 'long' : 'short';
-            state.currentPositionState = {
-                direction,
-                size: qty,
-                entryPrice: price,
-                openedAt: Date.now(),
-                pendingRiskExit: false
-            };
+            const active = state.currentPositionState;
+            if (active && active.direction === direction) {
+                const totalSize = active.size + qty;
+                if (totalSize > 0) {
+                    const newEntry = ((active.entryPrice ?? price) * active.size + price * qty) / totalSize;
+                    active.size = totalSize;
+                    active.entryPrice = newEntry;
+                    active.openedAt = Math.min(active.openedAt ?? Date.now(), Date.now());
+                    active.pendingRiskExit = false;
+                } else {
+                    state.currentPositionState = null;
+                }
+            } else {
+                state.currentPositionState = {
+                    direction,
+                    size: qty,
+                    entryPrice: price,
+                    openedAt: Date.now(),
+                    pendingRiskExit: false
+                };
+            }
             recordPendingOrder(side, price, qty);
             resetSignalHistory();
         } else if (type === 'close') {
             const active = state.currentPositionState;
             const direction = active?.direction ?? (side === 'buy' ? 'short' : 'long');
-            const effectiveQty = qty > 0 ? qty : (active?.size ?? 0);
+            const currentSize = active?.size ?? 0;
+            const effectiveQty = Math.min(qty > 0 ? qty : currentSize, currentSize);
             const entryPrice = Number.isFinite(active?.entryPrice) ? active.entryPrice : price;
             const pnl = direction === 'long'
                 ? (price - entryPrice) * effectiveQty
@@ -146,7 +161,15 @@ function createTradingState(config) {
                 : 0;
             const closeDir = direction === 'long' ? 'sell' : 'buy';
             state.pendingOrders[closeDir] = null;
-            state.currentPositionState = null;
+
+            const remaining = currentSize - effectiveQty;
+            if (active && remaining > 1e-8) {
+                active.size = remaining;
+                active.pendingRiskExit = false;
+                state.currentPositionState = active;
+            } else {
+                state.currentPositionState = null;
+            }
         }
     }
 
